@@ -139,6 +139,32 @@ impl<'a> ArrayBytesFixedDisjointView<'a> {
         self.contiguous_indices.contiguous_elements_usize() * self.data_type_size
     }
 
+    /// Return the bytes of the view as a mutable slice if the view is a single contiguous block.
+    ///
+    /// This enables decoding directly into the view without an intermediate buffer.
+    /// Returns [`None`] if the elements of the view are not contiguous in the underlying bytes.
+    ///
+    /// # Panics
+    /// Panics if an offset into the internal bytes reference exceeds [`usize::MAX`].
+    #[must_use]
+    pub fn as_contiguous_bytes_mut(&mut self) -> Option<&mut [u8]> {
+        if self.bytes_in_subset_len == 0 {
+            return Some(&mut []);
+        }
+        if self.contiguous_linearised_indices.len() != 1 {
+            return None;
+        }
+        let (index, _contiguous_elements) = self.contiguous_linearised_indices.iter().next()?;
+        let offset = usize::try_from(index * self.data_type_size as u64).unwrap();
+        debug_assert!(offset + self.bytes_in_subset_len <= self.bytes.len());
+        // SAFETY: The view is disjoint from all other views of the same bytes,
+        // and the returned slice holds a mutable borrow of the view.
+        Some(unsafe {
+            self.bytes
+                .index_mut(offset..offset + self.bytes_in_subset_len)
+        })
+    }
+
     /// Fill the view with the fill value.
     ///
     /// # Errors
@@ -437,5 +463,51 @@ mod tests {
             assert!(view.fill_elements(&[0], &[1, 2]).is_err()); // invalid fill value
         }
         assert_eq!(&bytes, &[0, 11, 255, 0, 255, 14, 0, 0, 0]);
+    }
+
+    #[test]
+    fn disjoint_view_as_contiguous_bytes_mut() {
+        let shape = vec![3, 3];
+        let mut bytes = vec![0u8; 9];
+        {
+            // Contiguous rows
+            let mut view = unsafe {
+                ArrayBytesFixedDisjointView::new(
+                    UnsafeCellSlice::new(&mut bytes),
+                    1,
+                    &shape,
+                    ArraySubset::new_with_ranges(&[1..3, 0..3]),
+                )
+            }
+            .unwrap();
+            view.as_contiguous_bytes_mut()
+                .unwrap()
+                .copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        }
+        assert_eq!(&bytes, &[0, 0, 0, 1, 2, 3, 4, 5, 6]);
+
+        // Non-contiguous view
+        let mut view = unsafe {
+            ArrayBytesFixedDisjointView::new(
+                UnsafeCellSlice::new(&mut bytes),
+                1,
+                &shape,
+                ArraySubset::new_with_ranges(&[0..2, 1..3]),
+            )
+        }
+        .unwrap();
+        assert!(view.as_contiguous_bytes_mut().is_none());
+
+        // Empty view
+        let mut view = unsafe {
+            ArrayBytesFixedDisjointView::new(
+                UnsafeCellSlice::new(&mut bytes),
+                1,
+                &shape,
+                ArraySubset::new_with_ranges(&[1..1, 0..3]),
+            )
+        }
+        .unwrap();
+        assert_eq!(view.as_contiguous_bytes_mut(), Some(&mut [][..]));
     }
 }

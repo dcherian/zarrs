@@ -13,10 +13,11 @@ use crate::array::{
 };
 use std::num::NonZeroU64;
 use zarrs_codec::{
-    ArrayBytes, ArrayCodecTraits, ArrayToBytesCodecTraits, BytesRepresentation, CodecCreateError,
-    CodecError, CodecMetadataOptions, CodecOptions, CodecSpecificOptions, CodecTraits, CowBytes,
-    PartialDecoderCapability, PartialEncoderCapability, RecommendedConcurrency,
-    UnboundArrayToBytesCodecTraits,
+    ArrayBytes, ArrayBytesDecodeIntoTarget, ArrayCodecTraits, ArrayToBytesCodecTraits,
+    BytesRepresentation, CodecCreateError, CodecError, CodecMetadataOptions, CodecOptions,
+    CodecSpecificOptions, CodecTraits, CowBytes, PartialDecoderCapability,
+    PartialEncoderCapability, RecommendedConcurrency, UnboundArrayToBytesCodecTraits,
+    decode_into_array_bytes_target,
 };
 use zarrs_metadata::Configuration;
 use zarrs_metadata_ext::codec::pcodec::{
@@ -261,6 +262,62 @@ impl ArrayToBytesCodecTraits for PcodecCodecBound {
             PcodecElementType::F64 => pcodec_decode!(f64),
         }?;
         Ok(ArrayBytes::from(bytes))
+    }
+
+    fn decode_into(
+        &self,
+        bytes: CowBytes<'_>,
+        shape: &[NonZeroU64],
+        output_target: ArrayBytesDecodeIntoTarget<'_>,
+        options: &CodecOptions,
+    ) -> Result<(), CodecError> {
+        // Decode in place if the target is one contiguous block, aligned for the element type.
+        // Otherwise, decode to an intermediate buffer and copy.
+        if let ArrayBytesDecodeIntoTarget::Fixed(view) = output_target {
+            let num_elements = usize::try_from(view.num_elements()).unwrap();
+            if let Some(output) = view.as_contiguous_bytes_mut() {
+                macro_rules! pcodec_decode_into {
+                    ( $t:ty ) => {
+                        if let Ok(output) = bytemuck::try_cast_slice_mut::<u8, $t>(output) {
+                            let expected = num_elements * self.elements_per_element;
+                            if output.len() != expected {
+                                return Err(CodecError::Other(format!(
+                                    "pcodec decode_into target has {} elements, expected {expected}",
+                                    output.len()
+                                )));
+                            }
+                            let progress = pco::standalone::simple_decompress_into(&bytes, output)
+                                .map_err(|err| CodecError::Other(err.to_string()))?;
+                            if progress.n_processed != expected || !progress.finished {
+                                return Err(CodecError::Other(format!(
+                                    "pcodec decoded {} elements, expected {expected}",
+                                    progress.n_processed
+                                )));
+                            }
+                            return Ok(());
+                        }
+                    };
+                }
+                match self.element_type {
+                    PcodecElementType::U16 => pcodec_decode_into!(u16),
+                    PcodecElementType::U32 => pcodec_decode_into!(u32),
+                    PcodecElementType::U64 => pcodec_decode_into!(u64),
+                    PcodecElementType::I16 => pcodec_decode_into!(i16),
+                    PcodecElementType::I32 => pcodec_decode_into!(i32),
+                    PcodecElementType::I64 => pcodec_decode_into!(i64),
+                    PcodecElementType::F16 => pcodec_decode_into!(half::f16),
+                    PcodecElementType::F32 => pcodec_decode_into!(f32),
+                    PcodecElementType::F64 => pcodec_decode_into!(f64),
+                }
+            }
+            let decoded = self.decode(bytes, shape, options)?;
+            return decode_into_array_bytes_target(
+                &decoded,
+                ArrayBytesDecodeIntoTarget::Fixed(view),
+            );
+        }
+        let decoded = self.decode(bytes, shape, options)?;
+        decode_into_array_bytes_target(&decoded, output_target)
     }
 
     fn encoded_representation(

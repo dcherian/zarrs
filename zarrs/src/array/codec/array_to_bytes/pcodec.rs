@@ -97,9 +97,10 @@ mod tests {
         ArrayBytes, ArraySubset, ChunkShape, ChunkShapeTraits, DataType, FillValue, data_type,
         transmute_to_bytes_vec,
     };
+    use unsafe_cell_slice::UnsafeCellSlice;
     use zarrs_codec::{
-        BytesPartialDecoderTraits, CodecOptions, CodecSpecificOptions,
-        UnboundArrayToBytesCodecTraits,
+        ArrayBytesDecodeIntoTarget, ArrayBytesFixedDisjointView, BytesPartialDecoderTraits,
+        CodecOptions, CodecSpecificOptions, UnboundArrayToBytesCodecTraits,
     };
 
     const JSON_VALID: &str = r#"{
@@ -402,5 +403,130 @@ mod tests {
             .collect();
         let answer: Vec<u32> = vec![4, 8];
         assert_eq!(transmute_to_bytes_vec(answer), decoded_partial_chunk);
+    }
+
+    /// Decode a chunk with `decode_into` into `subset` of an array of `array_shape`.
+    /// `offset` shifts the output bytes to test unaligned targets.
+    fn codec_pcodec_decode_into_impl(
+        data_type: DataType,
+        array_shape: &[u64],
+        subset: &ArraySubset,
+        offset: usize,
+    ) {
+        let chunk_shape: Vec<NonZeroU64> = subset
+            .shape()
+            .iter()
+            .map(|&s| NonZeroU64::new(s).unwrap())
+            .collect();
+        let element_size = data_type.fixed_size().unwrap();
+        let size = chunk_shape.num_elements_usize() * element_size;
+        let bytes: Vec<u8> = (0..size).map(|s| (s % 251) as u8).collect();
+
+        let codec = Arc::new(
+            PcodecCodec::new_with_configuration(&serde_json::from_str(JSON_VALID).unwrap())
+                .unwrap(),
+        )
+        .with_context(
+            data_type.clone(),
+            FillValue::new(vec![0; element_size]),
+            &CodecSpecificOptions::default(),
+        )
+        .unwrap();
+        let encoded = codec
+            .encode(
+                ArrayBytes::from(bytes.clone()),
+                &chunk_shape,
+                &CodecOptions::default(),
+            )
+            .unwrap();
+        let decoded = codec
+            .decode(encoded.clone(), &chunk_shape, &CodecOptions::default())
+            .unwrap()
+            .into_fixed()
+            .unwrap()
+            .to_vec();
+        assert_eq!(bytes, decoded);
+
+        // Expected output: the decoded chunk at `subset` in a zeroed array.
+        let array_size =
+            usize::try_from(array_shape.iter().product::<u64>()).unwrap() * element_size;
+        let mut expected = vec![0u8; array_size];
+        {
+            let mut view = unsafe {
+                // SAFETY: Only one view is created, so it is disjoint
+                ArrayBytesFixedDisjointView::new(
+                    UnsafeCellSlice::new(&mut expected),
+                    element_size,
+                    array_shape,
+                    subset.clone(),
+                )
+                .unwrap()
+            };
+            view.copy_from_slice(&decoded).unwrap();
+        }
+
+        let mut output = vec![0u8; array_size + offset];
+        {
+            let mut view = unsafe {
+                // SAFETY: Only one view is created, so it is disjoint
+                ArrayBytesFixedDisjointView::new(
+                    UnsafeCellSlice::new(&mut output[offset..]),
+                    element_size,
+                    array_shape,
+                    subset.clone(),
+                )
+                .unwrap()
+            };
+            codec
+                .decode_into(
+                    encoded,
+                    &chunk_shape,
+                    ArrayBytesDecodeIntoTarget::Fixed(&mut view),
+                    &CodecOptions::default(),
+                )
+                .unwrap();
+        }
+        assert_eq!(expected, output[offset..]);
+    }
+
+    #[test]
+    fn codec_pcodec_decode_into() {
+        for data_type in [
+            data_type::uint16(),
+            data_type::int32(),
+            data_type::int64(),
+            data_type::float32(),
+            data_type::float64(),
+            data_type::complex64(),
+        ] {
+            // Full contiguous view
+            codec_pcodec_decode_into_impl(
+                data_type.clone(),
+                &[10, 10],
+                &ArraySubset::new_with_shape(vec![10, 10]),
+                0,
+            );
+            // Contiguous rows of a larger array
+            codec_pcodec_decode_into_impl(
+                data_type.clone(),
+                &[20, 10],
+                &ArraySubset::new_with_ranges(&[5..15, 0..10]),
+                0,
+            );
+            // Strided subset of a larger array
+            codec_pcodec_decode_into_impl(
+                data_type.clone(),
+                &[20, 30],
+                &ArraySubset::new_with_ranges(&[5..15, 10..20]),
+                0,
+            );
+            // Unaligned output bytes
+            codec_pcodec_decode_into_impl(
+                data_type,
+                &[10, 10],
+                &ArraySubset::new_with_shape(vec![10, 10]),
+                1,
+            );
+        }
     }
 }
